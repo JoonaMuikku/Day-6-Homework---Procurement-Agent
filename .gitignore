@@ -3,3 +3,4 @@ venv/
 demo7.1-chat_history.db
 chat_history.db
 procurement_checkpoints.db
+procurement.db

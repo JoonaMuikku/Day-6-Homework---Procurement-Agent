@@ -25,16 +25,20 @@ import os
 import sqlite3
 import time
 from typing import Annotated, TypedDict
+import requests
+from pydantic import BaseModel, Field
 
 from langgraph.graph import StateGraph, START, END
 from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.types import interrupt, Command
 from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_core.tools import tool
 
 # ─── State ────────────────────────────────────────────────────────────────────
 
 class ProcurementState(TypedDict):
     request: str
+    quantity: int
     vendors: list[dict]
     quotes: list[dict]
     best_quote: dict
@@ -45,37 +49,64 @@ class ProcurementState(TypedDict):
 
 # ─── LLM (used only for the notification step to make it feel "agentic") ─────
 
-llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash-lite")
+llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash-lite", google_api_key="your_google_api_key") # Replace with your google_api_key
 
+# ─── Tool ───────────────────────────────────────────────────────
+@tool
+def get_unit_price(product_name: str) -> float:
+    """Fetches the live unit price for a laptop from the catalog."""
+    url = "https://dummyjson.com/products/category/laptops"
+    resp = requests.get(url)
+    if resp.status_code == 200:
+        products = resp.json().get("products", [])
+        for p in products:
+            if product_name.lower() in p["title"].lower():
+                return float(p["price"])
+    return 999.0 
+
+class QuantityExtractor(BaseModel):
+    quantity: int = Field(description="The number of units requested")
 
 # ─── Node functions ──────────────────────────────────────────────────────────
 
 def lookup_vendors(state: ProcurementState) -> dict:
-    """Step 1: Look up approved vendors for laptops."""
-    print("\n[Step 1] Looking up approved vendors...")
-    time.sleep(1)  # simulate API call
-    vendors = [
-        {"name": "Dell", "id": "V-001", "category": "laptops", "rating": 4.5},
-        {"name": "Lenovo", "id": "V-002", "category": "laptops", "rating": 4.3},
-        {"name": "HP", "id": "V-003", "category": "laptops", "rating": 4.1},
-    ]
+    """Step 1: Extract quantity and fetch live vendors from API"""
+    print("\n[Step 1] Parsing request and fetching live vendors...")
+    
+    extractor = llm.with_structured_output(QuantityExtractor)
+    res = extractor.invoke(state["request"])
+    qty = res.quantity
+
+    resp = requests.get("https://dummyjson.com/products/category/laptops")
+    all_prods = resp.json().get("products", [])
+    fast_prods = [p for p in all_prods if "month" not in p.get("shippingInformation", "").lower()]
+    fast_prods.sort(key=lambda x: x["price"])
+    
+    vendors = [{"name": p["title"], "delivery": p["shippingInformation"]} for p in fast_prods[:3]]
     for v in vendors:
-        print(f"   Found vendor: {v['name']} (rating {v['rating']})")
-    return {"vendors": vendors}
+        print(f"   Found: {v['name']} ({v['delivery']})")
+        
+    return {"vendors": vendors, "quantity": qty}
 
 
 def fetch_pricing(state: ProcurementState) -> dict:
-    """Step 2: Fetch current pricing from all 3 suppliers."""
-    print("\n[Step 2] Fetching pricing from suppliers...")
-    time.sleep(1.5)  # simulate multiple API calls
-    quotes = [
-        {"vendor": "Dell", "unit_price": 248, "total": 12_400, "delivery_days": 5},
-        {"vendor": "Lenovo", "unit_price": 235, "total": 11_750, "delivery_days": 7},
-        {"vendor": "HP", "unit_price": 259, "total": 12_950, "delivery_days": 4},
-    ]
-    for q in quotes:
-        print(f"   {q['vendor']}: €{q['unit_price']}/unit x 50 = €{q['total']:,} "
-              f"({q['delivery_days']} day delivery)")
+    """Step 2: Use tool calling to get prices"""
+    print("\n[Step 2] Fetching pricing via tool calls...")
+    quotes = []
+    qty = state.get("quantity", 1)
+    
+    for v in state["vendors"]:
+        price = get_unit_price.invoke({"product_name": v["name"]})
+        total = price * qty
+        
+        print(f"   {v['name']}: €{price}/unit x {qty} = €{total:,}")
+        
+        quotes.append({
+            "vendor": v["name"], 
+            "unit_price": price, 
+            "total": total, 
+            "delivery_days": v["delivery"]
+        })
     return {"quotes": quotes}
 
 
@@ -93,15 +124,16 @@ def compare_quotes(state: ProcurementState) -> dict:
 def request_approval(state: ProcurementState) -> dict:
     """Step 4: Human-in-the-loop — request manager approval for orders > €10,000."""
     best = state["best_quote"]
+    qty = state["quantity"]
     print("\n[Step 4] Order exceeds €10,000 — manager approval required!")
     print(f"   Sending approval request to manager...")
     amount_str = f"€{best['total']:,}"
-    delivery_str = f"{best['delivery_days']} business days"
+    delivery_str = f"{best['delivery_days']}"
     print(f"   ┌─────────────────────────────────────────────┐")
     print(f"   │  APPROVAL NEEDED                            │")
     print(f"   │  Vendor:   {best['vendor']:<33}│")
     print(f"   │  Amount:   {amount_str:<33}│")
-    print(f"   │  Items:    50 laptops for engineering team  │")
+    print(f"   │  Items:    {qty} laptops for engineering team  │")
     print(f"   │  Delivery: {delivery_str:<33}│")
     print(f"   └─────────────────────────────────────────────┘")
 
@@ -110,7 +142,7 @@ def request_approval(state: ProcurementState) -> dict:
     # The process can now exit completely. When resumed later (even days later),
     # execution continues right here with the resume value.
     decision = interrupt({
-        "message": f"Approve purchase of 50 laptops from {best['vendor']} for €{best['total']:,}?",
+        "message": f"Approve purchase of {qty} laptops from {best['vendor']} for €{best['total']:,}?",
         "vendor": best["vendor"],
         "amount": best["total"],
     })
@@ -121,7 +153,9 @@ def request_approval(state: ProcurementState) -> dict:
 
 def submit_purchase_order(state: ProcurementState) -> dict:
     """Step 5: Submit the purchase order to the ERP system."""
-    if "reject" in state["approval_status"].lower():
+    approval = state.get("approval_status", "").lower()
+
+    if "reject" in approval:
         print("\n[Step 5] Purchase REJECTED by manager. Aborting.")
         return {"po_number": "REJECTED"}
 
@@ -135,29 +169,29 @@ def submit_purchase_order(state: ProcurementState) -> dict:
 
 
 def notify_employee(state: ProcurementState) -> dict:
-    """Step 6: Use LLM to draft and send a notification to the employee."""
+    """Step 6: Handle both Approval and Rejection context (Task 3)."""
     print("\n[Step 6] Notifying employee...")
 
-    if state["po_number"] == "REJECTED":
-        prompt = (
-            f"Write a brief, professional notification (2-3 sentences) to an employee "
-            f"that their purchase request for 50 laptops was rejected by the manager. "
-            f"Be empathetic but concise."
-        )
-    else:
-        prompt = (
-            f"Write a brief, professional notification (2-3 sentences) to an employee "
-            f"that their purchase request has been approved and processed. "
-            f"Details: 50 laptops from {state['best_quote']['vendor']}, "
-            f"€{state['best_quote']['total']:,}, PO number {state['po_number']}, "
-            f"delivery in {state['best_quote']['delivery_days']} business days."
-        )
-
+    raw_status = state.get("approval_status", "Auto-approved (Under €10,000 threshold)")
+    is_rejected = "reject" in raw_status.lower()
+    
+    context = f"Status: {'Rejected' if is_rejected else 'Approved'}. Note: {raw_status}"
+    prompt = f"Draft a short, professional email to an employee about their order of {state['quantity']} laptops. Context: {context}"
+    
     response = llm.invoke(prompt)
-    notification = response.content
-    print(f"   Employee notification sent:")
-    print(f"   \"{notification}\"")
-    return {"notification": notification}
+    print(f"   Notification: \"{response.content}\"")
+    return {"notification": response.content}
+
+# ─── Routing Functions  ─────────────────────────────────────────
+def route_approval(state: ProcurementState):
+    if state["best_quote"]["total"] > 10000:
+        return "request_approval"
+    return "submit_purchase_order"
+
+def route_rejection(state: ProcurementState):
+    if "reject" in state["approval_status"].lower():
+        return "notify_employee"
+    return "submit_purchase_order"
 
 
 # ─── Build the graph ─────────────────────────────────────────────────────────
@@ -178,8 +212,8 @@ builder.add_node("notify_employee", notify_employee)
 builder.add_edge(START, "lookup_vendors")
 builder.add_edge("lookup_vendors", "fetch_pricing")
 builder.add_edge("fetch_pricing", "compare_quotes")
-builder.add_edge("compare_quotes", "request_approval")
-builder.add_edge("request_approval", "submit_purchase_order")
+builder.add_conditional_edges("compare_quotes", route_approval)
+builder.add_conditional_edges("request_approval", route_rejection)
 builder.add_edge("submit_purchase_order", "notify_employee")
 builder.add_edge("notify_employee", END)
 
@@ -194,29 +228,32 @@ config = {"configurable": {"thread_id": THREAD_ID}}
 # ─── Main ────────────────────────────────────────────────────────────────────
 
 def run_first_invocation(graph):
-    """First run: employee submits request, agent does steps 1-3, then suspends."""
     print("=" * 60)
     print("  FIRST INVOCATION — Employee submits purchase request")
     print("=" * 60)
-    print("\nEmployee request: \"Order 50 laptops for the new engineering team\"")
+    
+    request_str = "Order 9 laptops for the sales team" # Less than 9 (or 9) triggers automated approval, while more than 9 triggers manager approval
+    print(f"\nEmployee request: \"{request_str}\"")
 
     result = graph.invoke(
-        {"request": "Order 50 laptops for the new engineering team"},
+        {"request": request_str},
         config,
     )
 
-    # After interrupt, the graph returns with __interrupt__ info
-    print("\n" + "=" * 60)
-    print("AGENT SUSPENDED — waiting for manager approval")
-    print("=" * 60)
-    print("\n  The agent process can now exit completely.")
-    print("  All state (vendors, pricing, best quote) is frozen in SQLite.")
-    print(f"  Checkpoint DB: {DB_PATH}")
-    print(f"  Thread ID: {THREAD_ID}")
-    print("\n  In a real system, the manager gets a Slack/email notification.")
-    print("  They might respond hours or even days later.\n")
-    print("  To resume, run:")
-    print(f"    python {os.path.basename(__file__)} --resume\n")
+    snapshot = graph.get_state(config)
+    
+    if snapshot.next: 
+
+        print("\n" + "=" * 60)
+        print(f"AGENT SUSPENDED — waiting for human input at: {snapshot.next}")
+        print("=" * 60)
+        print("\n  The agent process can now exit completely.")
+        print("  To resume, run with --resume")
+    else:
+
+        print("\n" + "=" * 60)
+        print("WORKFLOW COMPLETE — No approval required.")
+        print("=" * 60)
 
 
 def run_second_invocation(graph):
@@ -244,7 +281,7 @@ def run_second_invocation(graph):
     time.sleep(1)
 
     result = graph.invoke(
-        Command(resume="Approved — go ahead with the purchase."),
+        Command(resume="Approved — go ahead with the purchase."), # Change to Rejected — over budget for rejection testing (and also change request_str laptop amount to something like 50)
         config,
     )
 
